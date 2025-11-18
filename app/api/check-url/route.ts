@@ -345,16 +345,17 @@ async function getGeminiURLAnalysis(url: string, localFindings: URLCheckResult):
       ? `🔍 Local security scan detected ${localFindings.indicators.length} warning signs:\n${localFindings.indicators.map((ind, i) => `  ${i + 1}. ${ind}`).join("\n")}\n\n📊 Risk Score: ${localFindings.riskScore}/100`
       : "✅ Local security scan found no obvious red flags"
 
-    // Create abort controller with 20 second timeout (leaving 10s buffer for Vercel)
-    const controller = new AbortController()
-    const timeoutId = setTimeout(() => controller.abort(), 20000)
+    // Create timeout promise
+    const timeoutPromise = new Promise<never>((_, reject) => 
+      setTimeout(() => reject(new Error('Gemini analysis timeout')), 18000)
+    )
 
     try {
-      const result = await generateObject({
-        model: google("gemini-2.0-flash-lite"),
-        schema: AnalysisSchema,
-        signal: controller.signal,
-        prompt: `You are an ELITE CYBERSECURITY ANALYST specializing in URL threat analysis.
+      const result = await Promise.race([
+        generateObject({
+          model: google("gemini-2.0-flash-lite"),
+          schema: AnalysisSchema,
+          prompt: `You are an ELITE CYBERSECURITY ANALYST specializing in URL threat analysis.
 Your verdict will be shown to users who need to decide if this link is safe to click.
 
 🎯 URL UNDER INVESTIGATION:
@@ -445,15 +446,16 @@ Analyze this URL for phishing, malware, scams, and other threats using expert pa
 - Be decisive and clear
 
 Provide your verdict NOW.`,
-      })
+        }),
+        timeoutPromise
+      ])
 
-      clearTimeout(timeoutId)
       return {
         verdict: result.object.verdict,
         explanation: result.object.explanation
       }
     } finally {
-      clearTimeout(timeoutId)
+      // Timeout already handled by Promise.race
     }
 
   } catch (error) {
