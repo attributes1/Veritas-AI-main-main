@@ -57,57 +57,51 @@ async function resolveURLRedirects(url: string): Promise<{
   }
 
   try {
-    // Use HEAD request to follow redirects without downloading content
-    const controller = new AbortController()
-    const timeoutId = setTimeout(() => controller.abort(), 5000) // 5 second timeout
-
-    const response = await fetch(currentUrl, {
-      method: 'HEAD',
-      redirect: 'manual', // We'll follow redirects manually to build chain
-      signal: controller.signal,
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (compatible; Veritas-AI-URLChecker/1.0)'
-      }
-    })
-
-    clearTimeout(timeoutId)
-
     // Follow redirect chain manually
     let nextUrl = currentUrl
     let attempts = 0
-    const maxRedirects = 10
+    const maxRedirects = 5 // Reduced from 10
+    const totalTimeLimit = 5000 // 5 second total timeout
 
-    while (attempts < maxRedirects) {
-      const checkResponse = await fetch(nextUrl, {
-        method: 'HEAD',
-        redirect: 'manual',
-        signal: AbortSignal.timeout(3000),
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (compatible; Veritas-AI-URLChecker/1.0)'
-        }
-      })
+    const startTime = Date.now()
 
-      // Check if it's a redirect (3xx status)
-      if (checkResponse.status >= 300 && checkResponse.status < 400) {
-        const location = checkResponse.headers.get('location')
-        if (!location) break
+    while (attempts < maxRedirects && (Date.now() - startTime) < totalTimeLimit) {
+      try {
+        const checkResponse = await fetch(nextUrl, {
+          method: 'HEAD',
+          redirect: 'manual',
+          signal: AbortSignal.timeout(2000), // 2 second per request
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (compatible; Veritas-AI-URLChecker/1.0)'
+          }
+        })
 
-        // Handle relative URLs
-        const redirectUrl = location.startsWith('http') 
-          ? location 
-          : new URL(location, nextUrl).toString()
+        // Check if it's a redirect (3xx status)
+        if (checkResponse.status >= 300 && checkResponse.status < 400) {
+          const location = checkResponse.headers.get('location')
+          if (!location) break
 
-        if (redirectChain.includes(redirectUrl)) {
-          // Circular redirect detected
+          // Handle relative URLs
+          const redirectUrl = location.startsWith('http') 
+            ? location 
+            : new URL(location, nextUrl).toString()
+
+          if (redirectChain.includes(redirectUrl)) {
+            // Circular redirect detected
+            break
+          }
+
+          redirectChain.push(redirectUrl)
+          nextUrl = redirectUrl
+          currentUrl = redirectUrl
+          attempts++
+        } else {
+          // No more redirects
           break
         }
-
-        redirectChain.push(redirectUrl)
-        nextUrl = redirectUrl
-        currentUrl = redirectUrl
-        attempts++
-      } else {
-        // No more redirects
+      } catch (fetchError) {
+        // If individual fetch fails, stop following redirects
+        console.error(`Fetch error on redirect attempt ${attempts}:`, fetchError)
         break
       }
     }
@@ -351,10 +345,16 @@ async function getGeminiURLAnalysis(url: string, localFindings: URLCheckResult):
       ? `🔍 Local security scan detected ${localFindings.indicators.length} warning signs:\n${localFindings.indicators.map((ind, i) => `  ${i + 1}. ${ind}`).join("\n")}\n\n📊 Risk Score: ${localFindings.riskScore}/100`
       : "✅ Local security scan found no obvious red flags"
 
-    const result = await generateObject({
-      model: google("gemini-2.0-flash-lite"),
-      schema: AnalysisSchema,
-      prompt: `You are an ELITE CYBERSECURITY ANALYST specializing in URL threat analysis.
+    // Create abort controller with 20 second timeout (leaving 10s buffer for Vercel)
+    const controller = new AbortController()
+    const timeoutId = setTimeout(() => controller.abort(), 20000)
+
+    try {
+      const result = await generateObject({
+        model: google("gemini-2.0-flash-lite"),
+        schema: AnalysisSchema,
+        signal: controller.signal,
+        prompt: `You are an ELITE CYBERSECURITY ANALYST specializing in URL threat analysis.
 Your verdict will be shown to users who need to decide if this link is safe to click.
 
 🎯 URL UNDER INVESTIGATION:
@@ -445,14 +445,28 @@ Analyze this URL for phishing, malware, scams, and other threats using expert pa
 - Be decisive and clear
 
 Provide your verdict NOW.`,
-    })
+      })
 
-    return {
-      verdict: result.object.verdict,
-      explanation: result.object.explanation
+      clearTimeout(timeoutId)
+      return {
+        verdict: result.object.verdict,
+        explanation: result.object.explanation
+      }
+    } finally {
+      clearTimeout(timeoutId)
     }
+
   } catch (error) {
     console.error("Gemini URL analysis error:", error)
+    
+    // Check if it's a timeout/abort error
+    if (error instanceof Error && (error.name === 'AbortError' || error.message.includes('timeout'))) {
+      return {
+        verdict: "suspicious",
+        explanation: "AI analysis timed out. URL appears suspicious - please verify manually before clicking.",
+      }
+    }
+
     return {
       verdict: "suspicious",
       explanation: "AI analysis encountered an error. Please verify this URL manually before clicking.",
@@ -487,74 +501,107 @@ export async function POST(request: NextRequest) {
 
     const { url } = validation.data
 
-    // Step 1: Resolve URL redirects (follow shortened URLs)
-    const redirectInfo = await resolveURLRedirects(url)
-    const urlToAnalyze = redirectInfo.finalUrl // Use final destination for analysis
-
-    // Step 2: Run local URL analysis on final destination
-    const localResult = performLocalURLAnalysis(urlToAnalyze)
-    
-    // Add redirect info to result
-    localResult.redirectChain = redirectInfo.redirectChain
-    localResult.finalDestination = redirectInfo.finalUrl
-    localResult.isShortened = redirectInfo.isShortened
-
-    // If shortened URL redirects to something dangerous, add indicator
-    if (redirectInfo.isShortened && redirectInfo.redirectChain.length > 1) {
-      localResult.indicators.unshift(
-        `🔗 SHORTENED URL: Redirects to ${redirectInfo.finalUrl}`
-      )
-    }
-
-    // Step 3: Get Gemini's final verdict (analyze final destination)
-    const apiKey = process.env.GOOGLE_GENERATIVE_AI_API_KEY
-
-    if (!apiKey) {
-      return NextResponse.json({
-        ...localResult,
-        aiAnalysis: "⚠️ API key not configured. Using local analysis only.",
-        geminiVerdict: localResult.riskLevel,
-      }, { status: 200 })
-    }
-
-    let geminiVerdictData
     try {
-      geminiVerdictData = await getGeminiURLAnalysis(urlToAnalyze, localResult)
-    } catch (error) {
-      console.error("Gemini analysis error:", error)
+      // Step 1: Resolve URL redirects (follow shortened URLs) - with timeout
+      let redirectInfo = {
+        finalUrl: url,
+        redirectChain: [url],
+        isShortened: false
+      }
+      
+      try {
+        redirectInfo = await Promise.race([
+          resolveURLRedirects(url),
+          new Promise((_, reject) => 
+            setTimeout(() => reject(new Error('Redirect resolution timeout')), 5000)
+          )
+        ]) as typeof redirectInfo
+      } catch (redirectError) {
+        console.error("Redirect resolution timeout, using original URL:", redirectError)
+        // Fall back to original URL
+      }
+
+      const urlToAnalyze = redirectInfo.finalUrl
+
+      // Step 2: Run local URL analysis on final destination
+      const localResult = performLocalURLAnalysis(urlToAnalyze)
+      
+      // Add redirect info to result
+      localResult.redirectChain = redirectInfo.redirectChain
+      localResult.finalDestination = redirectInfo.finalUrl
+      localResult.isShortened = redirectInfo.isShortened
+
+      // If shortened URL redirects to something dangerous, add indicator
+      if (redirectInfo.isShortened && redirectInfo.redirectChain.length > 1) {
+        localResult.indicators.unshift(
+          `🔗 SHORTENED URL: Redirects to ${redirectInfo.finalUrl}`
+        )
+      }
+
+      // Step 3: Get Gemini's final verdict (analyze final destination)
+      const apiKey = process.env.GOOGLE_GENERATIVE_AI_API_KEY
+
+      if (!apiKey) {
+        return NextResponse.json({
+          ...localResult,
+          aiAnalysis: "⚠️ API key not configured. Using local analysis only.",
+          geminiVerdict: localResult.riskLevel,
+        }, { status: 200 })
+      }
+
+      let geminiVerdictData
+      try {
+        geminiVerdictData = await Promise.race([
+          getGeminiURLAnalysis(urlToAnalyze, localResult),
+          new Promise<{ verdict: "safe" | "suspicious" | "dangerous"; explanation: string }>((_, reject) => 
+            setTimeout(() => reject(new Error('Gemini analysis timeout')), 22000)
+          )
+        ])
+      } catch (geminiError) {
+        console.error("Gemini analysis error or timeout:", geminiError)
+        // Fall back to local analysis
+        geminiVerdictData = {
+          verdict: localResult.riskLevel,
+          explanation: localResult.reason
+        }
+      }
+
+      // FINAL RESULT: Gemini's verdict is what user sees
+      const result: URLCheckResult = {
+        url: url, // Original URL
+        isSafe: geminiVerdictData.verdict === "safe",
+        riskLevel: geminiVerdictData.verdict,
+        riskScore: geminiVerdictData.verdict === "dangerous" ? 85 : geminiVerdictData.verdict === "suspicious" ? 60 : 15,
+        indicators: localResult.indicators,
+        redirectChain: redirectInfo.redirectChain,
+        finalDestination: redirectInfo.finalUrl,
+        isShortened: redirectInfo.isShortened,
+        reason: geminiVerdictData.explanation,
+        aiAnalysis: geminiVerdictData.explanation,
+        geminiVerdict: geminiVerdictData.verdict,
+      }
+
+      return NextResponse.json(result, { status: 200 })
+    } catch (innerError) {
+      console.error("URL check processing error:", innerError)
+      // Return error response with proper JSON
       return NextResponse.json(
         {
-          error: "AI analysis failed",
-          message: error instanceof Error ? error.message : "Failed to analyze URL",
+          error: "Failed to check URL",
+          message: innerError instanceof Error ? innerError.message : "Unknown error",
         },
         { status: 500 }
       )
     }
-
-    // FINAL RESULT: Gemini's verdict is what user sees
-    const result: URLCheckResult = {
-      url: url, // Original URL
-      isSafe: geminiVerdictData.verdict === "safe",
-      riskLevel: geminiVerdictData.verdict,
-      riskScore: geminiVerdictData.verdict === "dangerous" ? 85 : geminiVerdictData.verdict === "suspicious" ? 60 : 15,
-      indicators: localResult.indicators,
-      redirectChain: redirectInfo.redirectChain,
-      finalDestination: redirectInfo.finalUrl,
-      isShortened: redirectInfo.isShortened,
-      reason: geminiVerdictData.explanation,
-      aiAnalysis: geminiVerdictData.explanation,
-      geminiVerdict: geminiVerdictData.verdict,
-    }
-
-    return NextResponse.json(result, { status: 200 })
   } catch (error) {
-    console.error("URL check error:", error)
+    console.error("URL check request parsing error:", error)
+    // Ensure we return valid JSON even on parse errors
     return NextResponse.json(
       {
-        error: "Failed to check URL",
-        message: error instanceof Error ? error.message : "Unknown error",
+        error: "Invalid request format",
+        message: error instanceof Error ? error.message : "Failed to parse request",
       },
-      { status: 500 }
+      { status: 400 }
     )
   }
 }
